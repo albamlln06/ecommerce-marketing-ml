@@ -1,33 +1,11 @@
-from deep_translator import GoogleTranslator
 import pandas as pd
+from deep_translator import GoogleTranslator
 
-def translate_column(
-    df,
-    column: str,
-    target: str = "es",
-    source: str = "auto",
-    inplace: bool = False,
-) -> pd.DataFrame:
-    """
-    Traduce una columna de un DataFrame.
-    
-    Parámetros:
-    - df:      DataFrame de pandas
-    - column:  Nombre de la columna a traducir
-    - target:  Idioma destino (default: "es")
-    - source:  Idioma origen (default: "auto")
-    - inplace: Si True, sobreescribe la columna original
-               Si False, crea una nueva columna '{column}_translated'
-    """
-    if column not in df.columns:
-        raise ValueError(f"La columna '{column}' no existe en el DataFrame")
+def translate_reviews(df, field):
 
-    translator = GoogleTranslator(source=source, target=target)
-    translated = df[column].astype(str).apply(translator.translate)
+    traductor = GoogleTranslator(source='auto', target='en')
 
-    if inplace:
-        df[column] = translated
-    else:
-        df[f"{column}_translated"] = translated
-
+    df['english_review'] = df[field].apply(
+        lambda x: traductor.translate(x) if isinstance(x, str) else x
+    )
     return df

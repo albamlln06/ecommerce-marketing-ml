@@ -1,80 +1,51 @@
-import sys
 import os
-
-sys.path.append(os.path.abspath(".."))
-
+import numpy as np
 import pandas as pd
-from src.utils.file_utils import fetch_file 
+from scipy.sparse import csr_matrix
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, normalize
+import cornac
+from cornac.data import Dataset as CornacDataset
 
 
-CUSTOMER_URL = "https://drive.google.com/file/d/1Js2P2OX65L0mfWRv63g7z-XAv30fHl7r/view?usp=share_link"
-GEOLOCATION_URL = "https://drive.google.com/file/d/14pNzmp4Efr0NBJyCATceyDkRW_XzvTLQ/view?usp=share_link"
-ORDER_ITEMS_URL = "https://drive.google.com/file/d/1jLHg1ePMZw9tZ1S_b8JZBjTlSWzpTRU-/view?usp=share_link"
-ORDER_PAYMENTS_URL = "https://drive.google.com/file/d/1WAhjEt29Q3tsXqShpgMTq-6qNdeXM3St/view?usp=share_link"
-REVIEWS_URL = "https://drive.google.com/file/d/15vPOEMjN2nDKs5_1I1fSaktsDE-e_ftW/view?usp=share_link"
-ORDERS_URL = "https://drive.google.com/file/d/1jyFUxKFJFGZiHHf-7QuphbKvr5LsGtZR/view?usp=share_link"
-PRODUCTS_URL = "https://drive.google.com/file/d/18GWfqup9MmsxA8KtD_-s-RYSyL1Ec-nm/view?usp=share_link"
-SELLER_URL = "https://drive.google.com/file/d/1QNWrPqOn3Cxbj0qyOzm6p4Dsqp5SDyyg/view?usp=share_link"
-CATEGORIES_URL = "https://drive.google.com/file/d/1fQuNKaCxOjMqsCOrhwpGQ7Y9slmrrUCC/view?usp=share_link"
+# ─────────────────────────────────────────────
+# RUTAS LOCALES
+# ─────────────────────────────────────────────
 
-def load_datasets():
-    df_customer = fetch_file(CUSTOMER_URL)
-    df_seller = fetch_file(SELLER_URL)
-    df_geolocation = fetch_file(GEOLOCATION_URL)
-    df_order_items = fetch_file(ORDER_ITEMS_URL)
-    df_order_payments = fetch_file(ORDER_PAYMENTS_URL)
-    df_reviews = fetch_file(REVIEWS_URL)
-    df_orders = fetch_file(ORDERS_URL)
-    df_products = fetch_file(PRODUCTS_URL)
-    df_categories = fetch_file(CATEGORIES_URL)
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "data_files")
 
-    df_orders = order_process(df_orders)
-    df_reviews = review_process(df_reviews)
-    df_products = products_process(df_products, df_categories)
-    df_products = clean_products(df_products, df_order_items, df_categories)
+CUSTOMER_PATH       = os.path.join(_DATA_DIR, "olist_customers_dataset.csv")
+GEOLOCATION_PATH    = os.path.join(_DATA_DIR, "olist_geolocation_dataset.csv")
+ORDER_ITEMS_PATH    = os.path.join(_DATA_DIR, "olist_order_items_dataset.csv")
+ORDER_PAYMENTS_PATH = os.path.join(_DATA_DIR, "olist_order_payments_dataset.csv")
+REVIEWS_PATH        = os.path.join(_DATA_DIR, "reviews_translated.csv")
+ORDERS_PATH         = os.path.join(_DATA_DIR, "olist_orders_dataset.csv")
+PRODUCTS_PATH       = os.path.join(_DATA_DIR, "olist_products_dataset.csv")
+SELLER_PATH         = os.path.join(_DATA_DIR, "olist_sellers_dataset.csv")
+CATEGORIES_PATH     = os.path.join(_DATA_DIR, "product_category_name_translation.csv")
 
-    return {
-        "customer": df_customer,
-        "seller": df_seller,
-        "geolocation": df_geolocation,
-        "order_items": df_order_items,
-        "order_payments": df_order_payments,
-        "reviews": df_reviews,
-        "orders": df_orders,
-        "products": df_products,
-        "categories": df_categories
-    }
 
-def load_complete_dataset():
-    datasets = load_datasets()
+# ─────────────────────────────────────────────
+# CARGA Y PREPROCESAMIENTO BASE
+# ─────────────────────────────────────────────
 
-    df_complete = datasets["orders"].merge(datasets["customer"], on='customer_id', how='left')
-    df_complete = df_complete.merge(datasets["order_items"], left_on='order_id', right_on='order_id', how='left')
-    df_complete = df_complete.merge(datasets["products"], left_on='product_id', right_on='product_id', how='left')
-    df_complete = df_complete.merge(datasets["categories"], left_on='product_category_name', right_on='product_category_name', how='left')
-    df_complete = df_complete.merge(datasets["order_payments"], left_on='order_id', right_on='order_id', how='left')
-    df_complete = df_complete.merge(datasets["reviews"], left_on='order_id', right_on='order_id', how='left')
-    df_complete = df_complete.merge(datasets["seller"], left_on='seller_id', right_on='seller_id', how='left')
-
-    return df_complete
-
-def order_process(df_orders): 
+def order_process(df_orders):
     df_orders = df_orders[df_orders['order_status'] == 'delivered'].copy()
     date_cols = [
-    'order_purchase_timestamp',
-    'order_approved_at', 
-    'order_delivered_carrier_date',
-    'order_delivered_customer_date',
-    'order_estimated_delivery_date'
-]
+        'order_purchase_timestamp',
+        'order_approved_at',
+        'order_delivered_carrier_date',
+        'order_delivered_customer_date',
+        'order_estimated_delivery_date'
+    ]
     for col in date_cols:
         df_orders[col] = pd.to_datetime(df_orders[col])
     df_orders = df_orders.dropna(subset=['order_delivered_customer_date'])
     return df_orders
 
+
 def review_process(df_reviews):
     df_reviews['review_answer_timestamp'] = pd.to_datetime(
-    df_reviews['review_answer_timestamp']
+        df_reviews['review_answer_timestamp']
     )
     df_reviews = (
         df_reviews
@@ -83,49 +54,64 @@ def review_process(df_reviews):
     )
     return df_reviews
 
-def products_process(df_products, df_categories):
+
+def translate_categories(df_products):
+    """
+    Reemplaza product_category_name por su nombre en inglés.
+    Si no existe traducción, conserva el nombre original en portugués.
+    """
+    df_categories = pd.read_csv(CATEGORIES_PATH)
+    df_categories.columns = df_categories.columns.str.strip().str.lstrip('﻿')
+
+    translation = df_categories.set_index('product_category_name')['product_category_name_english']
+
+    df_products = df_products.copy()
     df_products['product_category_name'] = (
-        df_products['product_category_name'].fillna('unknown')
-    )
-    df_products = df_products.merge(df_categories, on='product_category_name', how='left')
-    df_products['category'] = (
-        df_products['product_category_name_english']
-        .fillna(df_products['product_category_name'])
+        df_products['product_category_name']
         .fillna('unknown')
+        .map(translation)
+        .fillna(df_products['product_category_name'].fillna('unknown'))
     )
     return df_products
 
+
+def products_process(df_products):
+    df_products = translate_categories(df_products)
+    df_products['category'] = df_products['product_category_name']
+    return df_products
+
+
 def iqr_filter(group, col, factor=3.0):
-        Q1 = group[col].quantile(0.25)
-        Q3 = group[col].quantile(0.75)
-        IQR = Q3 - Q1
-        return group[
-            (group[col] >= Q1 - factor * IQR) & 
-            (group[col] <= Q3 + factor * IQR)
-        ]
+    Q1 = group[col].quantile(0.25)
+    Q3 = group[col].quantile(0.75)
+    IQR = Q3 - Q1
+    return group[
+        (group[col] >= Q1 - factor * IQR) &
+        (group[col] <= Q3 + factor * IQR)
+    ]
+
 
 def clean_outliers(df, col, group_col='category', factor=3.0):
     return df.groupby(group_col, group_keys=False).apply(iqr_filter, col=col, factor=factor)
 
-def clean_scoring(df): 
 
+def clean_scoring(df):
     print(df['review_score'].value_counts(normalize=True))
 
-    #Rellenamos pedidos sin valorar con un score neutro (3) para que el modelo no los descarte por completo
+    # Rellenamos pedidos sin valorar con score neutro (3)
     df['rating'] = df['review_score'].fillna(3.0)
 
-    #Asignamos pesos más balanceados según el rating
+    # Pesos implícitos balanceados según el rating
     df['implicit_weight'] = df['rating'].map({
         1: 0.1, 2: 0.3, 3: 0.6, 4: 1.0, 5: 1.5
     }).fillna(0.6)
 
     return df
 
+
 def clean_products(df_products: pd.DataFrame,
                    df_items: pd.DataFrame,
-                   df_category: pd.DataFrame,
                    min_orders: int = 4) -> pd.DataFrame:
-
 
     product_freq = (
         df_items
@@ -135,15 +121,8 @@ def clean_products(df_products: pd.DataFrame,
     )
 
     valid_products = product_freq[product_freq['n_orders'] >= min_orders]['product_id']
-
     df_clean = df_products[df_products['product_id'].isin(valid_products)].copy()
 
-    df_clean = df_clean.merge(df_category, on='product_category_name', how='left')
-    df_clean['category'] = (
-        df_clean['product_category_name_english']
-        .fillna(df_clean['product_category_name'])
-        .fillna('unknown')
-    )
     df_clean = df_clean.drop(
         columns=['product_category_name', 'product_category_name_english'],
         errors='ignore'
@@ -151,19 +130,361 @@ def clean_products(df_products: pd.DataFrame,
 
     numeric_cols = df_clean.select_dtypes(include='number').columns
     for col in numeric_cols:
-        n_nulls = df_clean[col].isnull().sum()
-        if n_nulls > 0:
+        if df_clean[col].isnull().sum() > 0:
             df_clean[col] = df_clean[col].fillna(df_clean[col].median())
 
     df_clean = df_clean.merge(product_freq, on='product_id', how='left')
 
-    total     = len(df_products)
-    kept      = len(df_clean)
-    removed   = total - kept
-
-    print(total, "productos originales" )
-    print(kept, "productos resultantes" )
-    print(removed, "productos eliminados" )
+    total   = len(df_products)
+    kept    = len(df_clean)
+    removed = total - kept
+    print(f"{total} productos originales | {kept} resultantes | {removed} eliminados")
 
     return df_clean
 
+
+# ─────────────────────────────────────────────
+# CARGA DE DATASETS
+# ─────────────────────────────────────────────
+
+def load_datasets():
+    df_customer       = pd.read_csv(CUSTOMER_PATH)
+    df_seller         = pd.read_csv(SELLER_PATH)
+    df_geolocation    = pd.read_csv(GEOLOCATION_PATH)
+    df_order_items    = pd.read_csv(ORDER_ITEMS_PATH)
+    df_order_payments = pd.read_csv(ORDER_PAYMENTS_PATH)
+    df_reviews        = pd.read_csv(REVIEWS_PATH)
+    df_orders         = pd.read_csv(ORDERS_PATH)
+    df_products       = pd.read_csv(PRODUCTS_PATH)
+
+    df_orders   = order_process(df_orders)
+    df_reviews  = review_process(df_reviews)
+    df_products = products_process(df_products)
+    df_products = clean_products(df_products, df_order_items)
+
+    return {
+        "customer":       df_customer,
+        "seller":         df_seller,
+        "geolocation":    df_geolocation,
+        "order_items":    df_order_items,
+        "order_payments": df_order_payments,
+        "reviews":        df_reviews,
+        "orders":         df_orders,
+        "products":       df_products,
+    }
+
+
+def load_complete_dataset():
+    datasets = load_datasets()
+
+    df = datasets["orders"].merge(datasets["customer"],       on='customer_id',  how='left')
+    df = df.merge(datasets["order_items"],                    on='order_id',     how='left')
+    df = df.merge(datasets["products"],                       on='product_id',   how='left')
+    df = df.merge(datasets["order_payments"],                 on='order_id',     how='left')
+    df = df.merge(datasets["reviews"],                        on='order_id',     how='left')
+    df = df.merge(datasets["seller"],                         on='seller_id',    how='left')
+
+    # Añadir rating e implicit_weight
+    df = clean_scoring(df)
+
+    print(df.head())
+
+    return df
+
+
+# ─────────────────────────────────────────────
+# SPLIT TEMPORAL
+# ─────────────────────────────────────────────
+
+def temporal_split(df, train_ratio=0.8):
+    """
+    Split cronológico sobre order_purchase_timestamp.
+    NUNCA usar random split en sistemas de recomendación — causaría data leakage.
+    """
+    cutoff = df["order_purchase_timestamp"].quantile(train_ratio)
+    train  = df[df["order_purchase_timestamp"] <= cutoff].copy()
+    test   = df[df["order_purchase_timestamp"] >  cutoff].copy()
+
+    print(f"Cutoff: {cutoff.date()}")
+    print(f"Train:  {len(train):,} filas ({train['customer_unique_id'].nunique():,} usuarios)")
+    print(f"Test:   {len(test):,} filas  ({test['customer_unique_id'].nunique():,} usuarios)")
+
+    return train, test
+
+
+# ─────────────────────────────────────────────
+# FEATURES PARA CONTENT-BASED Y LIGHTFM HÍBRIDO
+# ─────────────────────────────────────────────
+
+def build_product_scores(train, C=5):
+    """
+    Suavizado bayesiano de la calificación por producto.
+    Productos con pocas reviews convergen hacia la media global.
+    Se calcula SOLO sobre train para evitar leakage.
+
+    C: peso del prior (más alto → más suavizado).
+    """
+    global_mean = train["rating"].mean()
+
+    product_scores = (
+        train.groupby("product_id")["rating"]
+        .agg(["mean", "count"])
+        .rename(columns={"mean": "avg_score", "count": "n_reviews"})
+    )
+    product_scores["smoothed_score"] = (
+        (product_scores["n_reviews"] * product_scores["avg_score"] + C * global_mean)
+        / (product_scores["n_reviews"] + C)
+    )
+
+    print(f"Scores calculados para {len(product_scores):,} productos | Media global: {global_mean:.3f}")
+    return product_scores[["smoothed_score"]], global_mean
+
+
+def build_geo_encodings(train):
+    """
+    Target encoding geográfico: media de rating por seller_city y customer_state.
+    Los valores desconocidos en test recibirán la media global como fallback.
+    Se calcula SOLO sobre train para evitar leakage.
+    """
+    seller_enc   = train.groupby("seller_city")["rating"].mean().rename("seller_city_score")
+    customer_enc = train.groupby("customer_state")["rating"].mean().rename("customer_state_score")
+
+    print(f"Geo encoding: {len(seller_enc)} ciudades de vendedor | {len(customer_enc)} estados de cliente")
+    return seller_enc, customer_enc
+
+
+def build_product_feature_matrix(df, product_scores, seller_enc, customer_enc,
+                                  global_mean, ohe=None, scaler=None, fit=True):
+    """
+    Construye la feature matrix normalizada (L2) por producto.
+
+    Parámetros
+    ----------
+    df             : DataFrame con una fila por interacción (train o test)
+    product_scores : Serie con smoothed_score por product_id (calculada en train)
+    seller_enc     : Target encoding de seller_city (calculado en train)
+    customer_enc   : Target encoding de customer_state (calculado en train)
+    global_mean    : Media global de rating (calculada en train)
+    ohe            : OneHotEncoder pre-fitteado (None si fit=True)
+    scaler         : StandardScaler pre-fitteado (None si fit=True)
+    fit            : True → entrena encoders (usar con train)
+                     False → solo transforma (usar con test/inference)
+
+    Retorna
+    -------
+    matrix_norm  : np.ndarray (n_productos x n_features), normalizado L2
+    product_ids  : lista de product_id en el mismo orden que las filas
+    ohe          : OneHotEncoder fitteado
+    scaler       : StandardScaler fitteado
+    """
+    # Una fila por producto único
+    catalog = df.drop_duplicates("product_id").reset_index(drop=True)
+
+    # ── 1. Categoría → One-Hot Encoding (peso x1) ──
+    cat_col = catalog[["category"]].fillna("unknown")
+    if fit:
+        ohe = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+        ohe.fit(cat_col)
+    cat_features = ohe.transform(cat_col)
+
+    # ── 2. Geográfico → Target Encoding (peso x1) ──
+    geo_features = (
+        catalog
+        .join(seller_enc,   on="seller_city",    how="left")
+        .join(customer_enc, on="customer_state",  how="left")
+        [["seller_city_score", "customer_state_score"]]
+        .fillna(global_mean)
+        .values
+    )
+
+    # ── 3. Atributos físicos → StandardScaler (peso x0.5) ──
+    quant_cols = [
+        "product_weight_g",
+        "product_length_cm",
+        "product_height_cm",
+        "product_width_cm"
+    ]
+    quant_data = catalog[quant_cols].fillna(catalog[quant_cols].median())
+    if fit:
+        scaler = StandardScaler()
+        scaler.fit(quant_data)
+    quant_features = scaler.transform(quant_data) * 0.5
+
+    # ── 4. Calificación suavizada (peso x2.0) ──
+    score_features = (
+        catalog[["product_id"]]
+        .merge(product_scores, on="product_id", how="left")
+        ["smoothed_score"]
+        .fillna(global_mean)
+        .values
+        .reshape(-1, 1)
+    ) * 2.0
+
+    # ── Concatenar y normalizar L2 ──
+    matrix      = np.hstack([cat_features, geo_features, quant_features, score_features])
+    matrix_norm = normalize(matrix, norm="l2")
+
+    product_ids = catalog["product_id"].tolist()
+    print(f"Feature matrix: {len(product_ids):,} productos x {matrix_norm.shape[1]} features")
+
+    return matrix_norm, product_ids, ohe, scaler
+
+
+# ─────────────────────────────────────────────
+# MATRICES DE INTERACCIÓN PARA LIGHTFM
+# ─────────────────────────────────────────────
+
+def build_interaction_matrix(df):
+    """
+    Matriz usuario x producto en formato sparse (CSR).
+    Usa implicit_weight de clean_scoring como valor de interacción
+    en lugar de 1s binarios, para reflejar la calidad de la interacción.
+    """
+    user_ids = df["customer_unique_id"].unique().tolist()
+    item_ids = df["product_id"].unique().tolist()
+
+    user_index = {u: i for i, u in enumerate(user_ids)}
+    item_index = {p: i for i, p in enumerate(item_ids)}
+
+    rows = df["customer_unique_id"].map(user_index)
+    cols = df["product_id"].map(item_index)
+    data = df["implicit_weight"].values
+
+    matrix = csr_matrix(
+        (data, (rows, cols)),
+        shape=(len(user_ids), len(item_ids))
+    )
+
+    density = matrix.nnz / (matrix.shape[0] * matrix.shape[1])
+    print(f"Interaction matrix: {matrix.shape} | Densidad: {density:.6f}")
+
+    return matrix, user_ids, item_ids, user_index, item_index
+
+
+
+def build_cornac_dataset(train):
+    """
+    Prepara los objetos nativos de Cornac.
+    Cornac espera una lista de tuplas (user_id, item_id, rating).
+    Usamos implicit_weight como valor de interacción.
+    """
+    # Lista de tuplas (usuario, producto, peso)
+    interactions = list(
+        train[["customer_unique_id", "product_id", "implicit_weight"]]
+        .itertuples(index=False, name=None)
+    )
+
+    # Dataset de Cornac
+    dataset = CornacDataset.from_uir(interactions, seed=42)
+
+    print(f"Cornac dataset: {dataset.num_users} usuarios | "
+          f"{dataset.num_items} items | "
+          f"{dataset.num_ratings} interacciones")
+
+    return dataset, interactions
+
+# ─────────────────────────────────────────────
+# PIPELINE COMPLETA
+# ─────────────────────────────────────────────
+
+def prepare_all(train_ratio=0.8, min_product_orders=4, score_prior=5):
+    """
+    Ejecuta la pipeline completa de preparación de datos.
+
+    Retorna un diccionario con todos los objetos listos para
+    entrenar Content-Based y LightFM (CF puro e híbrido).
+
+    Parámetros
+    ----------
+    train_ratio          : fracción temporal para train (default 0.8)
+    min_product_orders   : mínimo de órdenes para incluir un producto (default 4)
+    score_prior          : peso del prior en suavizado bayesiano (default 5)
+    """
+    print("=" * 55)
+    print("1. Cargando datasets...")
+    print("=" * 55)
+    df = load_complete_dataset()
+    print(df.head())
+
+    print("\n" + "=" * 55)
+    print("2. Split temporal...")
+    print("=" * 55)
+    train, test = temporal_split(df, train_ratio=train_ratio)
+
+    print("\n" + "=" * 55)
+    print("3. Calificación suavizada por producto...")
+    print("=" * 55)
+    product_scores, global_mean = build_product_scores(train, C=score_prior)
+
+    print("\n" + "=" * 55)
+    print("4. Encoding geográfico...")
+    print("=" * 55)
+    seller_enc, customer_enc = build_geo_encodings(train)
+
+    print("\n" + "=" * 55)
+    print("5. Feature matrix de productos (train)...")
+    print("=" * 55)
+    product_matrix, product_ids, ohe, scaler = build_product_feature_matrix(
+        train, product_scores, seller_enc, customer_enc,
+        global_mean, fit=True
+    )
+
+    print("\n" + "=" * 55)
+    print("6. Matriz de interacciones sparse (para LightFM CF)...")
+    print("=" * 55)
+    interaction_matrix, user_ids, item_ids, user_index, item_index = build_interaction_matrix(train)
+
+    print("\n" + "=" * 55)
+    print("7. Dataset nativo LightFM (CF puro + híbrido)...")
+    print("=" * 55)
+
+    dataset_cornac, interactions_cornac = build_cornac_dataset(train)
+    print("\n✓ Pipeline completada.\n")
+
+    return {
+        # DataFrames
+        "df_train"          : train,
+        "df_test"           : test,
+
+        # Encoders (fitteados en train, aplicar a test con fit=False)
+        "ohe"               : ohe,
+        "scaler"            : scaler,
+        "product_scores"    : product_scores,
+        "seller_enc"        : seller_enc,
+        "customer_enc"      : customer_enc,
+        "global_mean"       : global_mean,
+
+        # Content-Based
+        "product_matrix"    : product_matrix,   # np.ndarray (n_products x n_features)
+        "product_ids"       : product_ids,       # lista de product_id en orden
+
+        # LightFM CF puro (scipy sparse)
+        "interaction_matrix": interaction_matrix,
+        "user_ids"          : user_ids,
+        "item_ids"          : item_ids,
+        "user_index"        : user_index,
+        "item_index"        : item_index,
+
+        # Cornac híbrido (objetos nativos)
+        "dataset_cornac"     : dataset_cornac,
+        "interactions_cornac": interactions_cornac,
+    }
+
+
+if __name__ == "__main__":
+    data = prepare_all(
+        train_ratio=0.8,
+        min_product_orders=4,
+        score_prior=5
+    )
+
+    print("Objetos disponibles:")
+    for k, v in data.items():
+        if hasattr(v, "shape"):
+            print(f"  {k:25s} → shape {v.shape}")
+        elif isinstance(v, list):
+            print(f"  {k:25s} → lista de {len(v):,} elementos")
+        elif isinstance(v, dict):
+            print(f"  {k:25s} → dict de {len(v):,} elementos")
+        else:
+            print(f"  {k:25s} → {type(v).__name__}")

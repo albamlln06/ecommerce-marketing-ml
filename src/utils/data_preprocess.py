@@ -147,7 +147,7 @@ def clean_products(df_products: pd.DataFrame,
 # CARGA DE DATASETS
 # ─────────────────────────────────────────────
 
-def load_datasets():
+def load_datasets(min_product_orders=2):
     df_customer       = pd.read_csv(CUSTOMER_PATH)
     df_seller         = pd.read_csv(SELLER_PATH)
     df_geolocation    = pd.read_csv(GEOLOCATION_PATH)
@@ -160,7 +160,7 @@ def load_datasets():
     df_orders   = order_process(df_orders)
     df_reviews  = review_process(df_reviews)
     df_products = products_process(df_products)
-    df_products = clean_products(df_products, df_order_items)
+    df_products = clean_products(df_products, df_order_items, min_orders=min_product_orders)
 
     return {
         "customer":       df_customer,
@@ -174,8 +174,8 @@ def load_datasets():
     }
 
 
-def load_complete_dataset():
-    datasets = load_datasets()
+def load_complete_dataset(min_product_orders=2):
+    datasets = load_datasets(min_product_orders=min_product_orders)
 
     df = datasets["orders"].merge(datasets["customer"],       on='customer_id',  how='left')
     df = df.merge(datasets["order_items"],                    on='order_id',     how='left')
@@ -331,6 +331,41 @@ def build_product_feature_matrix(df, product_scores, seller_enc, customer_enc,
 
 
 # ─────────────────────────────────────────────
+# K-CORE FILTERING
+# ─────────────────────────────────────────────
+
+def kcore_filter(df, min_user_interactions=2, min_product_orders=4, max_iter=10):
+    """
+    Filtra iterativamente hasta que todos los usuarios tienen >= min_user_interactions
+    pedidos únicos y todos los productos tienen >= min_product_orders pedidos únicos.
+
+    Aplicar solo sobre train para evitar leakage. Los usuarios excluidos
+    (con una sola compra) se tratan como cold-start y reciben recomendaciones
+    basadas en contenido o popularidad.
+    """
+    for i in range(max_iter):
+        n_before = len(df)
+
+        product_counts = df.groupby("product_id")["order_id"].nunique()
+        valid_products = product_counts[product_counts >= min_product_orders].index
+        df = df[df["product_id"].isin(valid_products)]
+
+        user_counts = df.groupby("customer_unique_id")["order_id"].nunique()
+        valid_users = user_counts[user_counts >= min_user_interactions].index
+        df = df[df["customer_unique_id"].isin(valid_users)]
+
+        n_after = len(df)
+        print(f"  k-core iter {i+1}: {n_before:,} → {n_after:,} filas "
+              f"({df['customer_unique_id'].nunique():,} usuarios, "
+              f"{df['product_id'].nunique():,} productos)")
+
+        if n_after == n_before:
+            break
+
+    return df
+
+
+# ─────────────────────────────────────────────
 # MATRICES DE INTERACCIÓN PARA LIGHTFM
 # ─────────────────────────────────────────────
 
@@ -387,23 +422,27 @@ def build_cornac_dataset(train):
 # PIPELINE COMPLETA
 # ─────────────────────────────────────────────
 
-def prepare_all(train_ratio=0.8, min_product_orders=4, score_prior=5):
+def prepare_all(train_ratio=0.8, min_product_orders=2, min_user_interactions=2, score_prior=5):
     """
     Ejecuta la pipeline completa de preparación de datos.
 
-    Retorna un diccionario con todos los objetos listos para
-    entrenar Content-Based y LightFM (CF puro e híbrido).
+    Retorna un diccionario con todos los objetos listos para entrenar
+    Content-Based y modelos CF (Cornac BPR/MF/MostPop).
 
     Parámetros
     ----------
-    train_ratio          : fracción temporal para train (default 0.8)
-    min_product_orders   : mínimo de órdenes para incluir un producto (default 4)
-    score_prior          : peso del prior en suavizado bayesiano (default 5)
+    train_ratio            : fracción temporal para train (default 0.8)
+    min_product_orders     : mínimo de pedidos únicos para incluir un producto (default 4)
+    min_user_interactions  : mínimo de pedidos únicos para incluir un usuario en CF (default 2)
+    score_prior            : peso del prior en suavizado bayesiano (default 5)
+
+    Usuarios warm  → ≥ min_user_interactions compras → entran en los modelos CF
+    Usuarios cold  → 1 sola compra → fallback a Content-Based o MostPop
     """
     print("=" * 55)
     print("1. Cargando datasets...")
     print("=" * 55)
-    df = load_complete_dataset()
+    df = load_complete_dataset(min_product_orders=min_product_orders)
     print(df.head())
 
     print("\n" + "=" * 55)
@@ -412,41 +451,56 @@ def prepare_all(train_ratio=0.8, min_product_orders=4, score_prior=5):
     train, test = temporal_split(df, train_ratio=train_ratio)
 
     print("\n" + "=" * 55)
-    print("3. Calificación suavizada por producto...")
+    print("3. K-core filtering (train)...")
     print("=" * 55)
-    product_scores, global_mean = build_product_scores(train, C=score_prior)
+    train_cf = kcore_filter(
+        train,
+        min_user_interactions=min_user_interactions,
+        min_product_orders=min_product_orders,
+    )
+    cold_users = set(train["customer_unique_id"].unique()) - set(train_cf["customer_unique_id"].unique())
+    print(f"  Usuarios warm (CF):  {train_cf['customer_unique_id'].nunique():,}")
+    print(f"  Usuarios cold-start: {len(cold_users):,}  → fallback Content-Based / MostPop")
 
     print("\n" + "=" * 55)
-    print("4. Encoding geográfico...")
+    print("4. Calificación suavizada por producto...")
     print("=" * 55)
-    seller_enc, customer_enc = build_geo_encodings(train)
+    # Se calcula sobre train_cf para que las estadísticas reflejen solo usuarios con historial
+    product_scores, global_mean = build_product_scores(train_cf, C=score_prior)
 
     print("\n" + "=" * 55)
-    print("5. Feature matrix de productos (train)...")
+    print("5. Encoding geográfico...")
     print("=" * 55)
+    seller_enc, customer_enc = build_geo_encodings(train_cf)
+
+    print("\n" + "=" * 55)
+    print("6. Feature matrix de productos (train completo)...")
+    print("=" * 55)
+    # Se construye sobre train completo para cubrir también los productos de cold-start
     product_matrix, product_ids, ohe, scaler = build_product_feature_matrix(
         train, product_scores, seller_enc, customer_enc,
         global_mean, fit=True
     )
 
     print("\n" + "=" * 55)
-    print("6. Matriz de interacciones sparse (para LightFM CF)...")
+    print("7. Matriz de interacciones sparse (CF)...")
     print("=" * 55)
-    interaction_matrix, user_ids, item_ids, user_index, item_index = build_interaction_matrix(train)
+    interaction_matrix, user_ids, item_ids, user_index, item_index = build_interaction_matrix(train_cf)
 
     print("\n" + "=" * 55)
-    print("7. Dataset nativo LightFM (CF puro + híbrido)...")
+    print("8. Dataset nativo Cornac (CF puro + híbrido)...")
     print("=" * 55)
-
-    dataset_cornac, interactions_cornac = build_cornac_dataset(train)
+    dataset_cornac, interactions_cornac = build_cornac_dataset(train_cf)
     print("\n✓ Pipeline completada.\n")
 
     return {
         # DataFrames
-        "df_train"          : train,
+        "df_train"          : train,       # train completo (incluye cold-start)
+        "df_train_cf"       : train_cf,    # solo usuarios warm, para modelos CF
         "df_test"           : test,
+        "cold_users"        : cold_users,  # set de customer_unique_id sin historial suficiente
 
-        # Encoders (fitteados en train, aplicar a test con fit=False)
+        # Encoders (fitteados en train_cf, aplicar a test con fit=False)
         "ohe"               : ohe,
         "scaler"            : scaler,
         "product_scores"    : product_scores,
@@ -454,18 +508,18 @@ def prepare_all(train_ratio=0.8, min_product_orders=4, score_prior=5):
         "customer_enc"      : customer_enc,
         "global_mean"       : global_mean,
 
-        # Content-Based
-        "product_matrix"    : product_matrix,   # np.ndarray (n_products x n_features)
-        "product_ids"       : product_ids,       # lista de product_id en orden
+        # Content-Based (cubre catálogo completo, útil para cold-start)
+        "product_matrix"    : product_matrix,
+        "product_ids"       : product_ids,
 
-        # LightFM CF puro (scipy sparse)
+        # CF sparse (solo usuarios warm)
         "interaction_matrix": interaction_matrix,
         "user_ids"          : user_ids,
         "item_ids"          : item_ids,
         "user_index"        : user_index,
         "item_index"        : item_index,
 
-        # Cornac híbrido (objetos nativos)
+        # Cornac (solo usuarios warm)
         "dataset_cornac"     : dataset_cornac,
         "interactions_cornac": interactions_cornac,
     }
@@ -474,7 +528,8 @@ def prepare_all(train_ratio=0.8, min_product_orders=4, score_prior=5):
 if __name__ == "__main__":
     data = prepare_all(
         train_ratio=0.8,
-        min_product_orders=4,
+        min_product_orders=2,
+        min_user_interactions=2,
         score_prior=5
     )
 
@@ -486,5 +541,7 @@ if __name__ == "__main__":
             print(f"  {k:25s} → lista de {len(v):,} elementos")
         elif isinstance(v, dict):
             print(f"  {k:25s} → dict de {len(v):,} elementos")
+        elif isinstance(v, set):
+            print(f"  {k:25s} → set de {len(v):,} elementos")
         else:
             print(f"  {k:25s} → {type(v).__name__}")

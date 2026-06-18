@@ -25,6 +25,13 @@ class ContentBasedRecommender:
         print(f"Similarity matrix: {self.sim_matrix.shape}")
         return self
 
+    def score_all(self, product_ids_seen):
+        """Returns a score array over the full catalog (length = len(product_ids))."""
+        seen_indices = [self.id_to_idx[pid] for pid in product_ids_seen if pid in self.id_to_idx]
+        if not seen_indices:
+            return self.product_matrix[:, -1].copy()
+        return self.sim_matrix[seen_indices].mean(axis=0).copy()
+
     def recommend(self, product_ids_seen, top_k=10, exclude_seen=True):
         seen_indices = [
             self.id_to_idx[pid]

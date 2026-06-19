@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from sklearn.metrics import roc_auc_score
 
 # Allow running as: python models/train_eval.py  OR  python -m models.train_eval
 _ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,16 +20,92 @@ import models as m  # imports models/models.py
 # EVALUATION HELPERS
 # ─────────────────────────────────────────
 
-def get_test_relevant_items(data):
-    """Returns {customer_id: set(product_ids)} for users present in both train and test."""
-    test        = data["df_test"]
-    train_users = set(data["df_train"]["customer_unique_id"])
+def get_test_relevant_items(data, warm_only=False):
+    """
+    Returns {customer_id: set(product_ids)} for test users that also appear in train.
+
+    warm_only=True  → only users seen by the CF models (dataset_cornac)
+    warm_only=False → all train users (for Content-Based, which handles cold-start)
+    """
+    test = data["df_test"]
+    if warm_only:
+        train_users = set(data["dataset_cornac"].uid_map.keys())
+    else:
+        train_users = set(data["df_train"]["customer_unique_id"])
     return (
         test[test["customer_unique_id"].isin(train_users)]
         .groupby("customer_unique_id")["product_id"]
         .apply(set)
         .to_dict()
     )
+
+
+def get_test_relevant_categories(data, warm_only=False):
+    """
+    Returns {customer_id: set(categories)} for test users that also appear in train.
+    Relaxes evaluation from exact product match to category match.
+    """
+    test = data["df_test"]
+    if warm_only:
+        train_users = set(data["dataset_cornac"].uid_map.keys())
+    else:
+        train_users = set(data["df_train"]["customer_unique_id"])
+    return (
+        test[test["customer_unique_id"].isin(train_users)]
+        .dropna(subset=["category"])
+        .groupby("customer_unique_id")["category"]
+        .apply(set)
+        .to_dict()
+    )
+
+
+def build_product_category_map(data):
+    """Returns {product_id: category} covering both train and test."""
+    df = pd.concat([data["df_train"], data["df_test"]], ignore_index=True)
+    return (
+        df.dropna(subset=["category"])
+        .drop_duplicates("product_id")
+        .set_index("product_id")["category"]
+        .to_dict()
+    )
+
+
+def evaluate_ranking_by_category(get_recs_fn, relevant_categories, product_to_category,
+                                  k=10, max_users=300):
+    """
+    Like evaluate_ranking but maps recommended product_ids to categories before
+    computing hits. Each category counts at most once per user (deduped by rank).
+    """
+    precisions, recalls, ndcgs = [], [], []
+    for customer_id in list(relevant_categories.keys())[:max_users]:
+        try:
+            recs = get_recs_fn(customer_id)
+            # Map products → categories, keeping first occurrence of each category
+            seen_cats = set()
+            recommended_cats = []
+            for pid, _ in recs:
+                cat = product_to_category.get(pid)
+                if cat and cat not in seen_cats:
+                    recommended_cats.append(cat)
+                    seen_cats.add(cat)
+
+            relevant = relevant_categories[customer_id]
+            p, r = precision_recall_at_k(recommended_cats, relevant, k)
+            n     = ndcg_at_k(recommended_cats, relevant, k)
+            precisions.append(p)
+            recalls.append(r)
+            ndcgs.append(n)
+        except Exception:
+            continue
+
+    def _mean(lst):
+        return round(float(np.mean(lst)), 4) if lst else 0.0
+
+    return {
+        f"Precision@{k}": _mean(precisions),
+        f"Recall@{k}":    _mean(recalls),
+        f"NDCG@{k}":      _mean(ndcgs),
+    }
 
 
 def precision_recall_at_k(recommended, relevant, k=10):
@@ -71,6 +148,105 @@ def evaluate_ranking(get_recs_fn, relevant_items, k=10, max_users=300):
         f"Recall@{k}":    _mean(recalls),
         f"NDCG@{k}":     _mean(ndcgs),
     }
+
+
+# ─────────────────────────────────────────
+# AUROC
+# ─────────────────────────────────────────
+
+def auroc_content_based(cb_model, relevant_items, df_train, max_users=300):
+    """
+    AUROC a nivel de producto para Content-Based.
+    Para cada usuario: puntúa todos los productos del catálogo y calcula
+    AUROC entre los comprados en test (positivos) y el resto (negativos).
+    """
+    scores = []
+    for user_id, pos_items in list(relevant_items.items())[:max_users]:
+        products_seen = (
+            df_train.loc[df_train["customer_unique_id"] == user_id]
+            ["product_id"].tolist()
+        )
+        all_scores = cb_model.score_all(products_seen)           # (n_products,)
+        all_ids    = cb_model.product_ids
+
+        labels = [1 if pid in pos_items else 0 for pid in all_ids]
+        if sum(labels) == 0 or sum(labels) == len(labels):
+            continue  # necesita las dos clases para calcular AUROC
+
+        scores.append(roc_auc_score(labels, all_scores))
+
+    return round(float(np.mean(scores)), 4) if scores else 0.0
+
+
+def auroc_cornac_by_category(model, dataset_cornac, relevant_cats,
+                              product_to_category, max_users=300):
+    """
+    AUROC a nivel de categoría para modelos Cornac (BPR, MF, MostPop).
+    Para cada warm user: obtiene los scores de todos los items del catálogo,
+    los agrega por categoría (max) y calcula AUROC frente a las categorías
+    compradas en test.
+    """
+    scores = []
+    for user_id, pos_cats in list(relevant_cats.items())[:max_users]:
+        if user_id not in dataset_cornac.uid_map:
+            continue
+
+        user_idx   = dataset_cornac.uid_map[user_id]
+        item_scores = model.score(user_idx)  # array (n_items,)
+
+        # Agrupar scores por categoría (máximo de los productos de esa categoría)
+        cat_scores = {}
+        for item_id, item_idx in dataset_cornac.iid_map.items():
+            cat = product_to_category.get(item_id)
+            if cat is None:
+                continue
+            s = float(item_scores[item_idx])
+            if cat not in cat_scores or s > cat_scores[cat]:
+                cat_scores[cat] = s
+
+        if not cat_scores:
+            continue
+
+        cats   = list(cat_scores.keys())
+        preds  = [cat_scores[c] for c in cats]
+        labels = [1 if c in pos_cats else 0 for c in cats]
+
+        if sum(labels) == 0 or sum(labels) == len(labels):
+            continue
+
+        scores.append(roc_auc_score(labels, preds))
+
+    return round(float(np.mean(scores)), 4) if scores else 0.0
+
+
+def plot_auroc(auroc_results: dict, save_path: str = None):
+    """Gráfico de barras con el AUROC por modelo."""
+    models = list(auroc_results.keys())
+    values = list(auroc_results.values())
+    colors = ["#4C72B0" if v > 0.5 else "#DD8452" for v in values]
+
+    _, ax = plt.subplots(figsize=(max(8, len(models) * 1.6), 4))
+    bars  = ax.bar(models, values, color=colors, alpha=0.88)
+
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.005,
+                f"{val:.4f}", ha="center", va="bottom", fontsize=9)
+
+    ax.axhline(0.5, color="red", linestyle="--", linewidth=1, label="Random baseline (0.5)")
+    ax.set_ylim(0, 1.1)
+    ax.set_ylabel("AUROC")
+    ax.set_title("AUROC por modelo", fontsize=13, pad=14)
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    ax.spines[["top", "right"]].set_visible(False)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        print(f"Gráfico guardado en: {save_path}")
+
+    plt.show()
 
 
 # ─────────────────────────────────────────
@@ -142,9 +318,16 @@ def main(k=50, max_iter=200, embedding_dim=50):
     print("=" * 55)
     print("Preparing data...")
     print("=" * 55)
-    data           = prepare_all(train_ratio=0.8, min_product_orders=4, score_prior=5)
-    relevant_items = get_test_relevant_items(data)
-    print(f"\nTest users with train overlap: {len(relevant_items):,}")
+    data = prepare_all(train_ratio=0.8, score_prior=5)
+
+    relevant_items_all  = get_test_relevant_items(data, warm_only=False)
+    relevant_items_warm = get_test_relevant_items(data, warm_only=True)
+    relevant_cats_all   = get_test_relevant_categories(data, warm_only=False)
+    relevant_cats_warm  = get_test_relevant_categories(data, warm_only=True)
+    product_to_category = build_product_category_map(data)
+
+    print(f"\nTest users (all train overlap): {len(relevant_items_all):,}")
+    print(f"Test users (warm CF overlap):   {len(relevant_items_warm):,}")
 
     # ── 2. Train ──────────────────────────────────────────────────────────────
     models = m.train_all(data, k=embedding_dim, max_iter=max_iter)
@@ -174,37 +357,77 @@ def main(k=50, max_iter=200, embedding_dim=50):
         seen = df_train.loc[df_train["customer_unique_id"] == customer_id, "product_id"].tolist()
         return models["random"].recommend(customer_id, top_k=k, exclude_seen=seen)
 
-    # ── 4. Evaluate ──────────────────────────────────────────────────────────
-    print("\n" + "=" * 55)
-    print(f"Evaluating Precision@{k}, Recall@{k}, NDCG@{k}...")
-    print("=" * 55)
-
     model_fns = [
-        ("Content-Based", cb_recommend),
-        ("BPR (Cornac)",  bpr_recommend),
-        ("MF (Cornac)",   mf_recommend),
-        ("Most Popular",  pop_recommend),
-        ("Random",        random_recommend),
+        ("Content-Based", cb_recommend,     relevant_items_all,  relevant_cats_all),
+        ("BPR (Cornac)",  bpr_recommend,    relevant_items_warm, relevant_cats_warm),
+        ("MF (Cornac)",   mf_recommend,     relevant_items_warm, relevant_cats_warm),
+        ("Most Popular",  pop_recommend,    relevant_items_warm, relevant_cats_warm),
+        ("Random",        random_recommend, relevant_items_all,  relevant_cats_all),
     ]
 
-    rows = []
-    for name, fn in model_fns:
-        print(f"  · {name}...")
-        metrics = evaluate_ranking(fn, relevant_items, k=k, max_users=300)
-        rows.append({"Model": name, **metrics})
-
-    # ── 5. Results table + chart ─────────────────────────────────────────────
-    results = pd.DataFrame(rows)
+    # ── 4a. Evaluate by product ───────────────────────────────────────────────
     print("\n" + "=" * 55)
-    print("COMPARATIVE RESULTS")
+    print(f"Evaluating by PRODUCT  —  @{k}...")
     print("=" * 55)
-    print(results.to_string(index=False))
-    print()
+    rows_product = []
+    for name, fn, rel_items, _ in model_fns:
+        print(f"  · {name}...")
+        metrics = evaluate_ranking(fn, rel_items, k=k, max_users=300)
+        rows_product.append({"Model": name, **metrics})
 
-    plot_metrics(results, k=k, save_path="models/results_comparison.png")
+    # ── 4b. Evaluate by category ──────────────────────────────────────────────
+    print("\n" + "=" * 55)
+    print(f"Evaluating by CATEGORY —  @{k}...")
+    print("=" * 55)
+    rows_cat = []
+    for name, fn, _, rel_cats in model_fns:
+        print(f"  · {name}...")
+        metrics = evaluate_ranking_by_category(fn, rel_cats, product_to_category, k=k, max_users=300)
+        rows_cat.append({"Model": name, **metrics})
 
-    return results, models, data
+    # ── 5. Results tables ─────────────────────────────────────────────────────
+    results_product = pd.DataFrame(rows_product)
+    results_cat     = pd.DataFrame(rows_cat)
+
+    print("\n" + "=" * 55)
+    print("RESULTS BY PRODUCT (exact match)")
+    print("=" * 55)
+    print(results_product.to_string(index=False))
+
+    print("\n" + "=" * 55)
+    print("RESULTS BY CATEGORY (relaxed match)")
+    print("=" * 55)
+    print(results_cat.to_string(index=False))
+
+    # ── 6. AUROC ──────────────────────────────────────────────────────────────
+    print("\n" + "=" * 55)
+    print("Computing AUROC...")
+    print("=" * 55)
+    auroc_results = {
+        "Content-Based\n(product)": auroc_content_based(
+            models["content_based"], relevant_items_all, df_train, max_users=300
+        ),
+        "BPR\n(category)": auroc_cornac_by_category(
+            models["bpr"], dataset_cornac, relevant_cats_warm, product_to_category
+        ),
+        "MF\n(category)": auroc_cornac_by_category(
+            models["mf"], dataset_cornac, relevant_cats_warm, product_to_category
+        ),
+        "MostPop\n(category)": auroc_cornac_by_category(
+            models["most_popular"], dataset_cornac, relevant_cats_warm, product_to_category
+        ),
+    }
+    print("\nAUROC results:")
+    for name, val in auroc_results.items():
+        print(f"  {name.replace(chr(10), ' '):30s} {val:.4f}")
+
+    # ── 7. Charts ─────────────────────────────────────────────────────────────
+    plot_metrics(results_product, k=k, save_path="models/results_product.png")
+    plot_metrics(results_cat,     k=k, save_path="models/results_category.png")
+    plot_auroc(auroc_results,         save_path="models/results_auroc.png")
+
+    return results_product, results_cat, auroc_results, models, data
 
 
 if __name__ == "__main__":
-    main(k=50)
+    results_product, results_cat, auroc_results, models, data = main(k=50)

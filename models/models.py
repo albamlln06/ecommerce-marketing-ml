@@ -1,7 +1,7 @@
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from cornac.models import BPR, MF, MostPop
-
+from src.utils import data_preprocess
 
 # ─────────────────────────────────────────────
 # CONTENT-BASED
@@ -176,6 +176,33 @@ def recommend_for_user_cornac(customer_id, model, dataset_cornac, top_n=10):
     # train_set when remove_seen=True
     item_ids = model.recommend(user_id=customer_id, k=top_n, remove_seen=True, train_set=dataset_cornac)
     return [(iid, 0.0) for iid in item_ids]
+
+def cluster_products(K=6):
+    numeric_cols = [
+        'avg_price',
+        'product_weight_g',
+        'product_length_cm',
+        'product_height_cm',
+        'product_width_cm',
+        'avg_review_score'
+    ]
+
+    X_final, product_ids, scaler, df_products = data_preprocess.clustering_preprocess()
+
+    data_preprocess.find_optimal_k(X_final, k_range=range(2, 15))
+
+    df_product_clusters, kmeans_model = data_preprocess.fit_product_clustering(X_final, K, product_ids)
+
+    df_merged, summary = data_preprocess.inspect_clusters(
+        df_products=df_products,
+        df_clusters=df_product_clusters,
+        numeric_cols=numeric_cols,
+        category_col='category'
+    )
+
+    return df_product_clusters, kmeans_model, scaler, df_merged, summary
+
+
 
 
 # ─────────────────────────────────────────────

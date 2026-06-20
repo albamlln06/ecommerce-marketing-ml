@@ -5,11 +5,9 @@ from scipy.sparse import csr_matrix
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, normalize
 import cornac
 from cornac.data import Dataset as CornacDataset
-
-
-# ─────────────────────────────────────────────
-# RUTAS LOCALES
-# ─────────────────────────────────────────────
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "data_files")
 
@@ -24,9 +22,6 @@ SELLER_PATH         = os.path.join(_DATA_DIR, "olist_sellers_dataset.csv")
 CATEGORIES_PATH     = os.path.join(_DATA_DIR, "product_category_name_translation.csv")
 
 
-# ─────────────────────────────────────────────
-# CARGA Y PREPROCESAMIENTO BASE
-# ─────────────────────────────────────────────
 
 def order_process(df_orders):
     df_orders = df_orders[df_orders['order_status'] == 'delivered'].copy()
@@ -101,7 +96,6 @@ def clean_scoring(df):
     # Rellenamos pedidos sin valorar con score neutro (3)
     df['rating'] = df['review_score'].fillna(3.0)
 
-    # Pesos implícitos balanceados según el rating
     df['implicit_weight'] = df['rating'].map({
         1: 0.1, 2: 0.3, 3: 0.6, 4: 1.0, 5: 1.5
     }).fillna(0.6)
@@ -143,11 +137,7 @@ def clean_products(df_products: pd.DataFrame,
     return df_clean
 
 
-# ─────────────────────────────────────────────
-# CARGA DE DATASETS
-# ─────────────────────────────────────────────
-
-def load_datasets(min_product_orders=2):
+def load_datasets(min_product_orders=1):
     df_customer       = pd.read_csv(CUSTOMER_PATH)
     df_seller         = pd.read_csv(SELLER_PATH)
     df_geolocation    = pd.read_csv(GEOLOCATION_PATH)
@@ -184,17 +174,13 @@ def load_complete_dataset(min_product_orders=2):
     df = df.merge(datasets["reviews"],                        on='order_id',     how='left')
     df = df.merge(datasets["seller"],                         on='seller_id',    how='left')
 
-    # Añadir rating e implicit_weight
     df = clean_scoring(df)
 
     print(df.head())
 
     return df
 
-
-# ─────────────────────────────────────────────
-# SPLIT TEMPORAL
-# ─────────────────────────────────────────────
+#División train y test para modelos
 
 def temporal_split(df, train_ratio=0.8):
     """
@@ -211,10 +197,169 @@ def temporal_split(df, train_ratio=0.8):
 
     return train, test
 
+def get_product_avg_rating(df_products, df_order_items, df_order_reviews):
+    
+    items_reviews = df_order_items.merge(
+        df_order_reviews[['order_id', 'review_score']],
+        on='order_id',
+        how='inner'
+    )
+    
+    product_ratings = (
+        items_reviews
+        .groupby('product_id')['review_score']
+        .agg(avg_review_score='mean', n_reviews='count')
+        .reset_index()
+    )
+    
+    df_products_with_rating = df_products.merge(
+        product_ratings,
+        on='product_id',
+        how='left'
+    )
+    
+    return df_products_with_rating
 
-# ─────────────────────────────────────────────
-# FEATURES PARA CONTENT-BASED Y LIGHTFM HÍBRIDO
-# ─────────────────────────────────────────────
+def clustering_preprocess():
+    """
+    Preprocesamiento para clustering de productos.
+    Escalado de atributos numéricos y one-hot encoding de categoría.
+    Si se pasa df_train, calcula avg_price y avg_review_score solo con datos
+    de train para evitar leakage.
+    """
+    numeric_cols = [
+        'avg_price',
+        'product_weight_g',
+        'product_length_cm',
+        'product_height_cm',
+        'product_width_cm',
+        'avg_review_score'
+    ]
+
+    datasets = load_datasets()
+    df_products = datasets["products"]
+
+    df_order_items = datasets["order_items"]
+    df_reviews = datasets["reviews"]
+    df_products = get_product_avg_rating(df_products, df_order_items, df_reviews)
+    df_products = df_products.drop_duplicates(subset='product_id').copy()
+
+    avg_price = df_order_items.groupby('product_id')['price'].mean().rename('avg_price')
+    df_products = df_products.merge(avg_price, on='product_id', how='left')
+
+    df_products[numeric_cols] = df_products[numeric_cols].fillna(
+        df_products[numeric_cols].median()
+    )
+
+    scaler = StandardScaler()
+    X_numeric = scaler.fit_transform(df_products[numeric_cols])
+    print("Shape numéricas:", X_numeric.shape)
+
+    X_category = pd.get_dummies(
+        df_products['category'],
+        prefix='cat'
+    ).values
+    print("Shape categoría:", X_category.shape)
+
+    X_final = np.hstack([X_numeric, X_category])
+    print("Shape final:", X_final.shape)
+
+    product_ids = df_products['product_id'].values
+
+    return X_final, product_ids, scaler, df_products
+
+
+
+def find_optimal_k(X, k_range=range(2, 15)):
+
+    inertias = []
+    silhouettes = []
+    
+    for k in k_range:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(X)
+        
+        inertias.append(kmeans.inertia_)
+        silhouettes.append(silhouette_score(X, labels))
+        
+        print(f"K={k} | Inertia={kmeans.inertia_:.2f} | Silhouette={silhouettes[-1]:.4f}")
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    axes[0].plot(list(k_range), inertias, marker='o')
+    axes[0].set_title('Elbow Method (Inertia)')
+    axes[0].set_xlabel('K')
+    axes[0].set_ylabel('Inertia')
+    
+    axes[1].plot(list(k_range), silhouettes, marker='o', color='orange')
+    axes[1].set_title('Silhouette Score')
+    axes[1].set_xlabel('K')
+    axes[1].set_ylabel('Silhouette Score')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return inertias, silhouettes
+
+def fit_product_clustering(X, k, product_ids):
+    """
+    Entrena KMeans con el K elegido y devuelve un DataFrame
+    con product_id y su cluster asignado.
+    """
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    cluster_labels = kmeans.fit_predict(X)
+    
+    df_clusters = pd.DataFrame({
+        'product_id': product_ids,
+        'cluster': cluster_labels
+    })
+    
+    return df_clusters, kmeans
+
+def inspect_clusters(df_products, df_clusters, numeric_cols, category_col='category_name', top_n_categories=3):
+    """
+    Une los clusters con las features originales del producto y describe
+    cada cluster: medias de las variables numéricas y categorías más comunes.
+    
+    Parameters
+    ----------
+    df_products : DataFrame con product_id + columnas numéricas + categoría
+    df_clusters : DataFrame con columnas ['product_id', 'cluster']
+    numeric_cols : list de columnas numéricas usadas en el clustering
+    category_col : nombre de la columna de categoría de producto
+    top_n_categories : cuántas categorías top mostrar por cluster
+    
+    Returns
+    -------
+    df_merged : DataFrame combinado con la columna 'cluster' añadida
+    summary : DataFrame con la media de cada feature numérica por cluster
+    """
+    
+    df_merged = df_products.merge(df_clusters, on='product_id', how='inner')
+    
+    cluster_sizes = df_merged['cluster'].value_counts().sort_index()
+    print("=== Tamaño de cada cluster ===")
+    print(cluster_sizes)
+    print(f"\nTotal de productos: {len(df_merged)}\n")
+    
+    summary = df_merged.groupby('cluster')[numeric_cols].mean().round(2)
+    print("=== Medias de features numéricas por cluster ===")
+    print(summary)
+    print()
+    
+    print("=== Categorías más frecuentes por cluster ===")
+    for c in sorted(df_merged['cluster'].unique()):
+        cluster_data = df_merged[df_merged['cluster'] == c]
+        top_cats = cluster_data[category_col].value_counts(normalize=True).head(top_n_categories) * 100
+        
+        print(f"\nCluster {c} (n={len(cluster_data)}):")
+        for cat, pct in top_cats.items():
+            print(f"  {cat}: {pct:.1f}%")
+    
+    return df_merged, summary
+
+
+# funciones testing --------------------------------
 
 def build_product_scores(train, C=5):
     """
